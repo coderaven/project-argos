@@ -28,6 +28,9 @@ interface Hit {
   title: string;
   asin: string;
   seller: string;
+  sellerId?: string;
+  sellerAddress?: string;
+  sellerCountry?: string;
   sellerOrigin: string;
   confidence: number;
   verdict: "flag" | "review";
@@ -547,6 +550,9 @@ export default function Home() {
                                   <span>Seller: <span className="text-yellow-300 font-medium">{hit.seller}</span></span>
                                   <span>ASIN: <span className="text-slate-300 font-mono">{hit.asin}</span></span>
                                   {hit.price && <span>Price: <span className="text-slate-300">{hit.price}</span></span>}
+                                  {hit.sellerAddress && hit.sellerAddress !== "Not disclosed" && (
+                                    <span>📍 <span className="text-slate-300">{hit.sellerAddress} ({hit.sellerCountry})</span></span>
+                                  )}
                                   {hit.category && <span className="truncate max-w-xs">Category: <span className="text-slate-300">{hit.category}</span></span>}
                                 </div>
                                 <p className="text-xs text-slate-500 italic">🤖 {hit.reasoning}</p>

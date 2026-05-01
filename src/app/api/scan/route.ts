@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
+import { fetchSellerProfile, categorizeSellerOrigin } from "@/lib/seller-profile";
 
 // Allow up to 300s (Vercel Pro max) for long crawls
 export const maxDuration = 300;
@@ -132,12 +133,20 @@ function keywordInTitle(title: string, keyword: string): boolean {
   return new RegExp(`\\b${escaped}\\b`, "i").test(title);
 }
 
-function extractSeller(content: Record<string, unknown>): { name: string; shippedFrom: string } {
+function extractSeller(content: Record<string, unknown>): { name: string; shippedFrom: string; sellerId: string } {
   const merchant = content.featured_merchant as Record<string, string> | null;
-  if (merchant?.name) return { name: merchant.name, shippedFrom: merchant.shipped_from ?? "" };
+  if (merchant?.name) return {
+    name: merchant.name,
+    shippedFrom: merchant.shipped_from ?? "",
+    sellerId: merchant.seller_id ?? "",
+  };
   const buybox = content.buybox as Record<string, string>[] | null;
-  if (Array.isArray(buybox) && buybox.length > 0) return { name: buybox[0].seller_name ?? "", shippedFrom: "" };
-  return { name: "", shippedFrom: "" };
+  if (Array.isArray(buybox) && buybox.length > 0) return {
+    name: buybox[0].seller_name ?? "",
+    shippedFrom: "",
+    sellerId: buybox[0].seller_id ?? "",
+  };
+  return { name: "", shippedFrom: "", sellerId: "" };
 }
 
 function extractCategory(content: Record<string, unknown>): string {
@@ -152,7 +161,12 @@ interface CandidateForLLM {
   asin: string;
   title: string;
   seller: string;
+  sellerId: string;
   shippedFrom: string;
+  sellerCountry: string;      // from profile page: "US", "CN", etc.
+  sellerCountryFull: string;  // "United States", "China", etc.
+  sellerAddress: string;      // full address string
+  originCategory: string;     // "asia" | "japan" | "non-asia" | "unknown"
   price: string;
   category: string;
   url: string;
@@ -183,19 +197,22 @@ Claim Type: Trademark & Copyright Infringement
 Below are Amazon product listings that passed automated pre-filters. Assess each one and determine if it is likely an unauthorized/counterfeit item, needs review, or should be skipped.
 
 Verdict options:
-- "flag": High confidence this is unauthorized/counterfeit — third-party seller with no visible authorization, suspicious pricing, generic seller names, products that seem like knock-offs
-- "review": Uncertain — could be authorized reseller or counterfeit, a human should check
-- "skip": Definitely NOT counterfeit — known major authorized retailer (Target, Walmart, Best Buy, GameStop, Hot Topic, etc.), clearly licensed/official merchandise with proper branding, physical media like DVDs/Blu-rays, official books/art books, or products where the brand keyword appears only incidentally (e.g. a book titled 'The Art of Godzilla' is official, not counterfeit)
+- "flag": High confidence this is unauthorized/counterfeit — Asia-based seller (CN, HK, TW, KR, SG, etc.) with no visible authorization, or unknown origin with suspicious pricing/generic name
+- "review": Uncertain — FBA with undisclosed address, could be authorized reseller, borderline case needing human review
+- "skip": Definitely NOT in scope — verified US/EU/AU/CA/JP seller address, known major authorized retailer (Target, Walmart, Best Buy, Hot Topic, GameStop), official licensed media or books
 
-IMPORTANT: Physical merchandise (toys, figures, clothing, accessories) sold by small/unknown third-party sellers with no obvious authorization signal should generally be 'flag' or 'review'. Be especially suspicious of very low prices. Books, official art books, and licensed media should be 'skip'.
-
-For each product also guess the seller's geographic origin based on seller name patterns, pricing, and any other signals.
+IMPORTANT: The seller_address field is VERIFIED from Amazon's seller profile page — treat it as ground truth.
+- US/EU/CA/AU address → 'skip' (out of Asia scope)
+- China/HK/TW/KR/SG/Asia address → 'flag'
+- "Not disclosed" → use seller name, pricing, and category as signals; lean 'review'
 
 Products to assess:
 ${JSON.stringify(candidates.map(c => ({
   asin: c.asin,
   title: c.title,
   seller: c.seller,
+  seller_verified_address: c.sellerAddress || "Not disclosed",
+  seller_country: c.sellerCountryFull || "Unknown",
   shipped_from: c.shippedFrom || "unknown",
   price: c.price,
   category: c.category,
@@ -298,7 +315,7 @@ async function scanKeyword(
         if (!detail) return null;
 
         const dc = detail as Record<string, unknown>;
-        const { name: seller, shippedFrom } = extractSeller(dc);
+        const { name: seller, shippedFrom, sellerId } = extractSeller(dc);
         const category = extractCategory(dc);
         const detailTitle = (dc.title as string) ?? title;
         const detailVariations = (dc.variation as { title?: string }[]) ?? [];
@@ -308,13 +325,37 @@ async function scanKeyword(
         if (isAmazonSeller(seller)) return null;
         if (isHardDigital(detailTitle, Array.isArray(detailVariations) ? detailVariations : [])) return null;
         if (isHardMedia(detailTitle, category)) return null;
-        // NOTE: Books, coloring books, "digital camo" shirts, etc. go to LLM — not eliminated here
+
+        // ── Stage 2b: Fetch seller profile page for definitive origin ──────────
+        let sellerCountry = "";
+        let sellerCountryFull = "";
+        let sellerAddress = "";
+        let originCategory = "unknown";
+
+        if (sellerId) {
+          const profile = await fetchSellerProfile(sellerId);
+          const origin = categorizeSellerOrigin(profile);
+          originCategory = origin;
+          sellerCountry = profile.country ?? "";
+          sellerCountryFull = profile.countryFull ?? "";
+          sellerAddress = profile.businessAddress ?? profile.rawText?.slice(0, 100) ?? "";
+
+          // Skip non-Asia and Japan sellers definitively (no need for LLM)
+          if (origin === "japan" || origin === "non-asia") {
+            return null; // confirmed not in scope
+          }
+        }
 
         return {
           asin,
           title: detailTitle || title,
           seller,
+          sellerId,
           shippedFrom,
+          sellerCountry,
+          sellerCountryFull,
+          sellerAddress,
+          originCategory,
           price: typeof price === "number" ? `$${price}` : String(price),
           category,
           url,
@@ -362,9 +403,12 @@ async function scanKeyword(
         title: candidate.title,
         asin: candidate.asin,
         seller: candidate.seller,
+        sellerId: candidate.sellerId,
+        sellerAddress: candidate.sellerAddress || "Not disclosed",
+        sellerCountry: candidate.sellerCountryFull || candidate.sellerCountry || "Unknown",
         sellerOrigin: v.sellerOrigin,
         confidence: v.confidence,
-        verdict: v.verdict,           // "flag" | "review"
+        verdict: v.verdict,
         reasoning: v.reasoning,
         price: candidate.price,
         url: candidate.url,
