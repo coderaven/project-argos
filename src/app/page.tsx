@@ -20,6 +20,7 @@ import {
   X,
   Globe,
   Tag,
+  Sparkles,
 } from "lucide-react";
 
 interface Hit {
@@ -55,7 +56,37 @@ export default function Home() {
   const [logs, setLogs] = useState<string[]>([]);
   const [report, setReport] = useState<Report | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [suggesting, setSuggesting] = useState(false);
+  const [suggestions, setSuggestions] = useState<string[]>([]);
   const logsEndRef = useRef<HTMLDivElement>(null);
+
+  const fetchSuggestions = async () => {
+    const base = keywords[0]?.trim();
+    if (!base) return;
+    setSuggesting(true);
+    setSuggestions([]);
+    try {
+      const res = await fetch("/api/suggest", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ keyword: base }),
+      });
+      const data = await res.json();
+      setSuggestions(data.suggestions ?? []);
+    } catch {
+      // ignore
+    } finally {
+      setSuggesting(false);
+    }
+  };
+
+  const toggleSuggestion = (s: string) => {
+    if (keywords.includes(s)) {
+      setKeywords((prev) => prev.filter((k) => k !== s));
+    } else {
+      setKeywords((prev) => [...prev.filter((k) => k.trim() !== ""), s]);
+    }
+  };
 
   const addLog = (msg: string) => {
     setLogs((prev) => {
@@ -66,10 +97,14 @@ export default function Home() {
   };
 
   const addKeyword = () => setKeywords((prev) => [...prev, ""]);
-  const removeKeyword = (i: number) =>
+  const removeKeyword = (i: number) => {
     setKeywords((prev) => prev.filter((_, idx) => idx !== i));
-  const updateKeyword = (i: number, val: string) =>
+    if (i === 0) setSuggestions([]);
+  };
+  const updateKeyword = (i: number, val: string) => {
     setKeywords((prev) => prev.map((k, idx) => (idx === i ? val : k)));
+    if (i === 0) setSuggestions([]);
+  };
 
   const validKeywords = keywords.map((k) => k.trim()).filter(Boolean);
   const canScan = validKeywords.length > 0 && !scanning;
@@ -250,7 +285,7 @@ export default function Home() {
                 {keywords.map((kw, i) => (
                   <div key={i} className="flex gap-2">
                     <Input
-                      placeholder={`Keyword ${i + 1} — e.g. Godzilla, G0dzilla, Go-Dzilla`}
+                      placeholder={i === 0 ? "Primary keyword — e.g. Godzilla" : `Variant ${i} — e.g. G0dzilla, Go-Dzilla`}
                       value={kw}
                       onChange={(e) => updateKeyword(i, e.target.value)}
                       onKeyDown={(e) => {
@@ -261,13 +296,30 @@ export default function Home() {
                       className="bg-slate-800 border-slate-700 text-white placeholder:text-slate-500 focus-visible:ring-red-500/50"
                       disabled={scanning}
                     />
+                    {/* AI suggest button — only on first keyword */}
+                    {i === 0 && (
+                      <Button
+                        variant="outline"
+                        size="icon"
+                        onClick={fetchSuggestions}
+                        disabled={scanning || suggesting || !keywords[0]?.trim()}
+                        title="AI-suggest keyword variants"
+                        className="border-slate-600 text-purple-400 hover:text-purple-300 hover:border-purple-500 hover:bg-purple-500/10 cursor-pointer shrink-0"
+                      >
+                        {suggesting ? (
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                        ) : (
+                          <Sparkles className="w-4 h-4" />
+                        )}
+                      </Button>
+                    )}
                     {keywords.length > 1 && (
                       <Button
                         variant="ghost"
                         size="icon"
                         onClick={() => removeKeyword(i)}
                         disabled={scanning}
-                        className="text-slate-500 hover:text-red-400 hover:bg-red-500/10 cursor-pointer"
+                        className="text-slate-500 hover:text-red-400 hover:bg-red-500/10 cursor-pointer shrink-0"
                       >
                         <X className="w-4 h-4" />
                       </Button>
@@ -275,6 +327,48 @@ export default function Home() {
                   </div>
                 ))}
               </div>
+
+              {/* AI suggestion chips */}
+              {suggestions.length > 0 && (
+                <div className="space-y-2 p-3 rounded-lg border border-purple-800/40 bg-purple-950/20">
+                  <p className="text-xs text-purple-300 flex items-center gap-1.5">
+                    <Sparkles className="w-3 h-3" />
+                    AI-suggested variants — click to add or remove:
+                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    {suggestions.map((s) => {
+                      const selected = keywords.includes(s);
+                      return (
+                        <button
+                          key={s}
+                          onClick={() => toggleSuggestion(s)}
+                          disabled={scanning}
+                          className={`px-3 py-1 rounded-full text-xs font-mono border transition-all cursor-pointer ${
+                            selected
+                              ? "bg-purple-600/40 border-purple-400 text-purple-100"
+                              : "bg-slate-800 border-slate-600 text-slate-300 hover:border-purple-500 hover:text-purple-200"
+                          }`}
+                        >
+                          {selected ? "✓ " : "+ "}{s}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <button
+                    onClick={() => {
+                      const toAdd = suggestions.filter((s) => !keywords.includes(s));
+                      if (toAdd.length > 0) {
+                        setKeywords((prev) => [...prev.filter((k) => k.trim() !== ""), ...toAdd]);
+                      }
+                    }}
+                    disabled={scanning || suggestions.every((s) => keywords.includes(s))}
+                    className="text-xs text-purple-400 hover:text-purple-200 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    + Add all suggestions
+                  </button>
+                </div>
+              )}
+
               <Button
                 variant="ghost"
                 onClick={addKeyword}
@@ -282,7 +376,7 @@ export default function Home() {
                 className="text-slate-400 hover:text-white text-xs h-8 cursor-pointer"
               >
                 <Plus className="w-3.5 h-3.5 mr-1" />
-                Add another keyword
+                Add another keyword manually
               </Button>
             </div>
 
