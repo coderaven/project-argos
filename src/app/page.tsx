@@ -29,10 +29,12 @@ interface Hit {
   asin: string;
   seller: string;
   sellerOrigin: string;
+  confidence: number;
+  verdict: "flag" | "review";
+  reasoning: string;
   price: string;
   url: string;
   category?: string;
-  reason: string;
 }
 
 interface Report {
@@ -175,9 +177,11 @@ export default function Home() {
   const exportCSV = () => {
     if (!report || report.hits.length === 0) return;
     const q = (s: string) => `"${(s ?? "").replace(/"/g, '""')}"`;
-    const headers = ["#", "Keyword", "Title", "ASIN", "Seller", "Seller Origin", "Price", "Category", "URL", "Reason"];
+    const headers = ["#", "Verdict", "Confidence", "Keyword", "Title", "ASIN", "Seller", "Seller Origin", "Price", "Category", "AI Reasoning", "URL"];
     const rows = report.hits.map((h, i) => [
       i + 1,
+      h.verdict,
+      `${Math.round(h.confidence * 100)}%`,
       q(h.keyword),
       q(h.title),
       h.asin,
@@ -185,8 +189,8 @@ export default function Home() {
       q(h.sellerOrigin),
       h.price,
       q(h.category ?? ""),
+      q(h.reasoning),
       h.url,
-      q(h.reason),
     ]);
     const csv = [headers.join(","), ...rows.map((r) => r.join(","))].join("\n");
     const blob = new Blob([csv], { type: "text/csv" });
@@ -509,17 +513,27 @@ export default function Home() {
                       {kwHits.map((hit, i) => (
                         <Card
                           key={hit.asin + i}
-                          className="bg-slate-900/60 border-red-900/40 hover:border-red-700/60 transition-colors"
+                          className={`bg-slate-900/60 transition-colors ${
+                            hit.verdict === "flag"
+                              ? "border-red-900/40 hover:border-red-700/60"
+                              : "border-yellow-900/40 hover:border-yellow-700/60"
+                          }`}
                         >
                           <CardContent className="px-5 py-4">
                             <div className="flex items-start justify-between gap-4">
                               <div className="flex-1 min-w-0 space-y-1.5">
                                 <div className="flex items-center gap-2 flex-wrap">
-                                  <Badge className="bg-red-900/40 text-red-300 border-red-800/50 text-[10px]">
-                                    Flagged
+                                  {hit.verdict === "flag" ? (
+                                    <Badge className="bg-red-900/40 text-red-300 border-red-800/50 text-[10px]">🚨 Flagged</Badge>
+                                  ) : (
+                                    <Badge className="bg-yellow-900/40 text-yellow-300 border-yellow-800/50 text-[10px]">⚠️ Needs Review</Badge>
+                                  )}
+                                  <Badge className="bg-slate-800 text-slate-400 border-slate-700 text-[10px]">
+                                    {Math.round(hit.confidence * 100)}% confidence
                                   </Badge>
                                   <Badge
                                     className={`text-[10px] border ${
+                                      hit.sellerOrigin.toLowerCase().includes("china") ||
                                       hit.sellerOrigin.toLowerCase().includes("asia")
                                         ? "bg-orange-900/30 text-orange-300 border-orange-800/40"
                                         : "bg-slate-800 text-slate-400 border-slate-700"
@@ -535,7 +549,7 @@ export default function Home() {
                                   {hit.price && <span>Price: <span className="text-slate-300">{hit.price}</span></span>}
                                   {hit.category && <span className="truncate max-w-xs">Category: <span className="text-slate-300">{hit.category}</span></span>}
                                 </div>
-                                <p className="text-xs text-slate-500 italic">{hit.reason}</p>
+                                <p className="text-xs text-slate-500 italic">🤖 {hit.reasoning}</p>
                               </div>
                               {hit.url && (
                                 <a

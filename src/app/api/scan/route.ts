@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import OpenAI from "openai";
 
 // Allow up to 300s (Vercel Pro max) for long crawls
 export const maxDuration = 300;
@@ -7,7 +8,9 @@ const OXYLABS_USER = process.env.OXYLABS_USER!;
 const OXYLABS_PASS = process.env.OXYLABS_PASS!;
 const OXYLABS_URL = "https://realtime.oxylabs.io/v1/queries";
 
-// ── Seller filter sets ────────────────────────────────────────────────────────
+const LLM_MODEL = "gpt-4.1-mini"; // Use gpt-4.1-mini (latest mini available)
+
+// ── Filter sets ───────────────────────────────────────────────────────────────
 
 const AMAZON_SELLERS = new Set([
   "amazon.com",
@@ -16,60 +19,6 @@ const AMAZON_SELLERS = new Set([
   "amazon media eu s.à r.l.",
   "amazon",
 ]);
-
-// Asia-based countries we WANT to flag (excl. Japan)
-const ASIA_NON_JAPAN_SIGNALS = [
-  "china", "chinese", "cn",
-  "hong kong", "hk",
-  "taiwan", "tw",
-  "south korea", "korea", "kr",
-  "vietnam", "vn",
-  "thailand", "th",
-  "philippines", "ph",
-  "indonesia", "id",
-  "malaysia", "my",
-  "singapore", "sg",
-  "india", "in",
-  "bangladesh", "bd",
-  "cambodia", "kh",
-  "myanmar", "mm",
-  "sri lanka", "lk",
-  "pakistan", "pk",
-  "shenzhen", "guangzhou", "beijing", "shanghai", "dongguan", "yiwu",
-  "guangdong", "zhejiang", "fujian",
-];
-
-// Japan — we SKIP these
-const JAPAN_SIGNALS = [
-  "japan", "japanese", "jp",
-  "tokyo", "osaka", "kyoto",
-];
-
-// Clearly non-Asian western sellers — skip
-const NON_ASIA_SIGNALS = [
-  "united states", "usa", "u.s.a",
-  "canada", "ca",
-  "united kingdom", "uk", "england", "scotland",
-  "germany", "de", "deutschland",
-  "france", "fr",
-  "italy", "it",
-  "spain", "es",
-  "australia", "au",
-  "netherlands", "nl",
-  "sweden", "se",
-  "norway", "no",
-  "denmark", "dk",
-  "switzerland", "ch",
-  "austria", "at",
-  "poland", "pl",
-  "portugal", "pt",
-  "ireland", "ie",
-  "new zealand", "nz",
-  "brazil", "br",
-  "mexico", "mx",
-];
-
-// ── Product filter sets ───────────────────────────────────────────────────────
 
 const DIGITAL_SIGNALS = [
   "kindle edition", "kindle", "ebook", "e-book",
@@ -98,35 +47,6 @@ const MEDIA_CATEGORIES = [
   "movies & tv", "blu-ray", "dvd", "amazon video", "prime video",
 ];
 
-// ── Seller origin classification ──────────────────────────────────────────────
-
-type SellerOrigin = "asia" | "japan" | "non-asia" | "unknown";
-
-function classifySellerOrigin(shippedFrom: string, sellerName: string): SellerOrigin {
-  const combined = `${shippedFrom} ${sellerName}`.toLowerCase();
-
-  if (JAPAN_SIGNALS.some((s) => combined.includes(s))) return "japan";
-  if (ASIA_NON_JAPAN_SIGNALS.some((s) => combined.includes(s))) return "asia";
-  if (NON_ASIA_SIGNALS.some((s) => combined.includes(s))) return "non-asia";
-
-  // Check for obviously US-based patterns
-  if (
-    shippedFrom.toLowerCase().includes("amazon") ||
-    shippedFrom.toLowerCase().includes("fulfilled")
-  ) {
-    return "unknown"; // FBA — could be anywhere, include for review
-  }
-
-  return "unknown";
-}
-
-function originLabel(origin: SellerOrigin, shippedFrom: string): string {
-  if (origin === "asia") return `Asia-based (${shippedFrom || "detected"})`;
-  if (origin === "japan") return `Japan`;
-  if (origin === "non-asia") return `Non-Asia (${shippedFrom || "detected"})`;
-  return `Unknown origin (FBA — review required)`;
-}
-
 // ── Oxylabs helpers ───────────────────────────────────────────────────────────
 
 async function oxylabsSearch(keyword: string, page: number, zipCode: string) {
@@ -135,8 +55,7 @@ async function oxylabsSearch(keyword: string, page: number, zipCode: string) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization:
-          "Basic " + Buffer.from(`${OXYLABS_USER}:${OXYLABS_PASS}`).toString("base64"),
+        Authorization: "Basic " + Buffer.from(`${OXYLABS_USER}:${OXYLABS_PASS}`).toString("base64"),
       },
       body: JSON.stringify({
         source: "amazon_search",
@@ -148,16 +67,10 @@ async function oxylabsSearch(keyword: string, page: number, zipCode: string) {
         geo_location: zipCode,
       }),
     });
-    if (!resp.ok) {
-      console.error(`Oxylabs search failed: ${resp.status}`);
-      return null;
-    }
+    if (!resp.ok) return null;
     const data = await resp.json();
     return data?.results?.[0]?.content ?? null;
-  } catch (e) {
-    console.error("Oxylabs search error:", e);
-    return null;
-  }
+  } catch { return null; }
 }
 
 async function oxylabsProduct(asin: string, zipCode: string) {
@@ -166,8 +79,7 @@ async function oxylabsProduct(asin: string, zipCode: string) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization:
-          "Basic " + Buffer.from(`${OXYLABS_USER}:${OXYLABS_PASS}`).toString("base64"),
+        Authorization: "Basic " + Buffer.from(`${OXYLABS_USER}:${OXYLABS_PASS}`).toString("base64"),
       },
       body: JSON.stringify({
         source: "amazon_product",
@@ -180,13 +92,10 @@ async function oxylabsProduct(asin: string, zipCode: string) {
     if (!resp.ok) return null;
     const data = await resp.json();
     return data?.results?.[0]?.content ?? null;
-  } catch (e) {
-    console.error("Oxylabs product error:", e);
-    return null;
-  }
+  } catch { return null; }
 }
 
-// ── Product filter helpers ────────────────────────────────────────────────────
+// ── Deterministic pre-filters ─────────────────────────────────────────────────
 
 function isAmazonSeller(seller: string): boolean {
   return AMAZON_SELLERS.has(seller.trim().toLowerCase());
@@ -217,27 +126,108 @@ function isMediaProduct(title: string, category: string): boolean {
 
 function keywordInTitle(title: string, keyword: string): boolean {
   const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const pattern = new RegExp(`\\b${escaped}\\b`, "i");
-  return pattern.test(title);
+  return new RegExp(`\\b${escaped}\\b`, "i").test(title);
 }
 
 function extractSeller(content: Record<string, unknown>): { name: string; shippedFrom: string } {
   const merchant = content.featured_merchant as Record<string, string> | null;
-  if (merchant?.name) {
-    return { name: merchant.name, shippedFrom: merchant.shipped_from ?? "" };
-  }
+  if (merchant?.name) return { name: merchant.name, shippedFrom: merchant.shipped_from ?? "" };
   const buybox = content.buybox as Record<string, string>[] | null;
-  if (Array.isArray(buybox) && buybox.length > 0) {
-    return { name: buybox[0].seller_name ?? "", shippedFrom: "" };
-  }
+  if (Array.isArray(buybox) && buybox.length > 0) return { name: buybox[0].seller_name ?? "", shippedFrom: "" };
   return { name: "", shippedFrom: "" };
 }
 
 function extractCategory(content: Record<string, unknown>): string {
   const catList = content.category as { ladder?: { name: string }[] }[] | null;
   if (!Array.isArray(catList) || catList.length === 0) return "";
-  const ladder = catList[0].ladder ?? [];
-  return ladder.map((c) => c.name).join(" > ");
+  return (catList[0].ladder ?? []).map((c) => c.name).join(" > ");
+}
+
+// ── LLM batch assessment ──────────────────────────────────────────────────────
+
+interface CandidateForLLM {
+  asin: string;
+  title: string;
+  seller: string;
+  shippedFrom: string;
+  price: string;
+  category: string;
+  url: string;
+  keyword: string;
+}
+
+interface LLMVerdict {
+  asin: string;
+  verdict: "flag" | "review" | "skip";
+  confidence: number;       // 0.0 – 1.0
+  sellerOrigin: string;     // LLM's best guess on where seller is based
+  reasoning: string;        // Brief explanation
+}
+
+async function llmAssessBatch(
+  brandKeyword: string,
+  candidates: CandidateForLLM[],
+  client: OpenAI
+): Promise<Map<string, LLMVerdict>> {
+  const resultMap = new Map<string, LLMVerdict>();
+  if (candidates.length === 0) return resultMap;
+
+  const prompt = `You are a trademark and copyright enforcement specialist helping identify potential counterfeit or unauthorized products on Amazon.
+
+Brand/Keyword: "${brandKeyword}"
+Claim Type: Trademark & Copyright Infringement
+
+Below are Amazon product listings that passed automated pre-filters. Assess each one and determine if it is likely an unauthorized/counterfeit item, needs review, or should be skipped.
+
+Verdict options:
+- "flag": High confidence this is unauthorized/counterfeit — third-party seller with no visible authorization, suspicious pricing, generic seller names, products that seem like knock-offs
+- "review": Uncertain — could be authorized reseller or counterfeit, a human should check
+- "skip": Likely legitimate — known authorized reseller, clearly licensed merchandise, major established retailer
+
+For each product also guess the seller's geographic origin based on seller name patterns, pricing, and any other signals.
+
+Products to assess:
+${JSON.stringify(candidates.map(c => ({
+  asin: c.asin,
+  title: c.title,
+  seller: c.seller,
+  shipped_from: c.shippedFrom || "unknown",
+  price: c.price,
+  category: c.category,
+})), null, 2)}
+
+Respond ONLY with a JSON array. No extra text. Format:
+[
+  {
+    "asin": "B0XXXXX",
+    "verdict": "flag" | "review" | "skip",
+    "confidence": 0.0-1.0,
+    "sellerOrigin": "e.g. Likely China-based, Likely US distributor, Unknown",
+    "reasoning": "One sentence explanation"
+  }
+]`;
+
+  try {
+    const response = await client.chat.completions.create({
+      model: LLM_MODEL,
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.2,
+      max_tokens: 1000,
+    });
+
+    const raw = response.choices[0].message.content ?? "[]";
+    const match = raw.match(/\[[\s\S]*\]/);
+    if (!match) return resultMap;
+
+    const verdicts: LLMVerdict[] = JSON.parse(match[0]);
+    for (const v of verdicts) {
+      if (v.asin) resultMap.set(v.asin, v);
+    }
+  } catch (e) {
+    console.error("LLM batch assessment failed:", e);
+  }
+
+  return resultMap;
 }
 
 // ── Core scan function (one keyword, all pages) ───────────────────────────────
@@ -246,12 +236,9 @@ async function scanKeyword(
   keyword: string,
   maxPages: number,
   zipCode: string,
+  client: OpenAI,
   send: (event: string, data: object) => void
-): Promise<{
-  hits: object[];
-  pagesScanned: number;
-  productsChecked: number;
-}> {
+): Promise<{ hits: object[]; pagesScanned: number; productsChecked: number }> {
   const hits: object[] = [];
   let pagesScanned = 0;
   let productsChecked = 0;
@@ -261,7 +248,7 @@ async function scanKeyword(
 
     const content = await oxylabsSearch(keyword, page, zipCode);
     if (!content) {
-      send("progress", { message: `[${keyword}] Page ${page}: no data, stopping.` });
+      send("progress", { message: `[${keyword}] Page ${page}: no data returned, stopping.` });
       break;
     }
 
@@ -273,8 +260,8 @@ async function scanKeyword(
       ...((resultsBlock.amazons_choices as Record<string, unknown>[]) ?? []),
     ];
 
-    // Pre-filter on search page (no extra API call)
-    const candidates = items.filter((item) => {
+    // ── Stage 1: Deterministic pre-filter ─────────────────────────────────────
+    const preFiltered = items.filter((item) => {
       const title = (item.title as string) ?? "";
       const variations = (item.variations as { title?: string }[]) ?? [];
       if (!keywordInTitle(title, keyword)) return false;
@@ -284,14 +271,18 @@ async function scanKeyword(
     });
 
     send("progress", {
-      message: `[${keyword}] Page ${page}: ${items.length} products, ${candidates.length} candidates after pre-filter. Checking sellers...`,
+      message: `[${keyword}] Page ${page}: ${items.length} products → ${preFiltered.length} passed pre-filter. Fetching details...`,
     });
 
-    productsChecked += candidates.length;
+    if (preFiltered.length === 0) {
+      const lastVisiblePage = (content.last_visible_page as number) ?? page;
+      if (lastVisiblePage <= page) break;
+      continue;
+    }
 
-    // Parallel product detail fetches for this page
-    const detailResults = await Promise.all(
-      candidates.map(async (item) => {
+    // ── Stage 2: Parallel product detail fetch ────────────────────────────────
+    const detailFetches = await Promise.all(
+      preFiltered.map(async (item) => {
         const title = (item.title as string) ?? "";
         const asin = (item.asin as string) ?? "";
         const price = item.price ?? "";
@@ -301,57 +292,83 @@ async function scanKeyword(
         const detail = await oxylabsProduct(asin, zipCode);
         if (!detail) return null;
 
-        const detailContent = detail as Record<string, unknown>;
-        const { name: seller, shippedFrom } = extractSeller(detailContent);
-        const category = extractCategory(detailContent);
-        const detailTitle = (detailContent.title as string) ?? title;
-        const detailVariations = (detailContent.variation as { title?: string }[]) ?? [];
+        const dc = detail as Record<string, unknown>;
+        const { name: seller, shippedFrom } = extractSeller(dc);
+        const category = extractCategory(dc);
+        const detailTitle = (dc.title as string) ?? title;
+        const detailVariations = (dc.variation as { title?: string }[]) ?? [];
 
-        // Filter: must have a seller
+        // Hard deterministic eliminators — no point sending to LLM
         if (!seller) return null;
-        // Filter: not Amazon
         if (isAmazonSeller(seller)) return null;
-        // Filter: not digital
         if (isDigital(detailTitle, Array.isArray(detailVariations) ? detailVariations : [])) return null;
-        // Filter: not media/books
         if (isMediaProduct(detailTitle, category)) return null;
 
-        // Seller origin check
-        const origin = classifySellerOrigin(shippedFrom, seller);
-
-        // Skip Japan sellers and clearly non-Asian sellers
-        if (origin === "japan" || origin === "non-asia") {
-          send("progress", {
-            message: `[${keyword}] Skipped "${seller}" — ${origin === "japan" ? "Japan-based" : "non-Asia seller"}`,
-          });
-          return null;
-        }
-
-        // Flag asia + unknown (FBA)
-        const sellerOriginLabel = originLabel(origin, shippedFrom);
-
         return {
-          keyword,
-          title: detailTitle || title,
           asin,
+          title: detailTitle || title,
           seller,
-          sellerOrigin: sellerOriginLabel,
+          shippedFrom,
           price: typeof price === "number" ? `$${price}` : String(price),
-          url,
           category,
-          reason:
-            origin === "asia"
-              ? `Asia-based third-party seller (${shippedFrom || "detected"})`
-              : `Third-party seller — origin unverifiable (FBA, review required)`,
-        };
+          url,
+          keyword,
+        } as CandidateForLLM;
       })
     );
 
-    for (const hit of detailResults) {
-      if (!hit) continue;
+    const candidates = detailFetches.filter((c): c is CandidateForLLM => c !== null);
+    productsChecked += candidates.length;
+
+    if (candidates.length === 0) {
+      const lastVisiblePage = (content.last_visible_page as number) ?? page;
+      if (lastVisiblePage <= page) break;
+      continue;
+    }
+
+    send("progress", {
+      message: `[${keyword}] Page ${page}: ${candidates.length} candidate(s) → sending to AI for assessment...`,
+    });
+
+    // ── Stage 3: LLM batch assessment ─────────────────────────────────────────
+    const verdicts = await llmAssessBatch(keyword, candidates, client);
+
+    for (const candidate of candidates) {
+      const verdict = verdicts.get(candidate.asin);
+
+      // If LLM failed for this ASIN, fall back to "review"
+      const v = verdict ?? {
+        verdict: "review" as const,
+        confidence: 0.5,
+        sellerOrigin: "Unknown (LLM unavailable)",
+        reasoning: "Automated assessment unavailable — manual review recommended.",
+      };
+
+      if (v.verdict === "skip") {
+        send("progress", {
+          message: `[${keyword}] Skipped "${candidate.seller}" — ${v.reasoning}`,
+        });
+        continue;
+      }
+
+      const hit = {
+        keyword: candidate.keyword,
+        title: candidate.title,
+        asin: candidate.asin,
+        seller: candidate.seller,
+        sellerOrigin: v.sellerOrigin,
+        confidence: v.confidence,
+        verdict: v.verdict,           // "flag" | "review"
+        reasoning: v.reasoning,
+        price: candidate.price,
+        url: candidate.url,
+        category: candidate.category,
+      };
       hits.push(hit);
+
+      const emoji = v.verdict === "flag" ? "🚨" : "⚠️";
       send("candidate", {
-        message: `[${keyword}] Hit: ${(hit as { title: string }).title} — Seller: ${(hit as { seller: string }).seller} (${(hit as { sellerOrigin: string }).sellerOrigin})`,
+        message: `${emoji} [${keyword}] ${candidate.title} — Seller: ${candidate.seller} | Origin: ${v.sellerOrigin} (${Math.round(v.confidence * 100)}% confidence)`,
       });
     }
 
@@ -372,7 +389,6 @@ export async function POST(req: NextRequest) {
   const body = await req.json();
 
   const campaignName: string = (body.campaignName ?? "Untitled Campaign").trim();
-  // Accept keywords as array or as single string
   let keywords: string[] = [];
   if (Array.isArray(body.keywords)) {
     keywords = body.keywords.map((k: string) => k.trim()).filter(Boolean);
@@ -387,6 +403,7 @@ export async function POST(req: NextRequest) {
   const zipCode: string = (body.zipCode ?? "10019").trim();
 
   const encoder = new TextEncoder();
+  const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
   const stream = new ReadableStream({
     async start(controller) {
@@ -398,22 +415,18 @@ export async function POST(req: NextRequest) {
 
       try {
         send("status", {
-          message: `Starting campaign "${campaignName}" — ${keywords.length} keyword(s), up to ${maxPages} pages each, shipping to ZIP ${zipCode}...`,
+          message: `Starting campaign "${campaignName}" — ${keywords.length} keyword(s), up to ${maxPages} pages each, ZIP ${zipCode}. Using 2-stage filter + AI assessment (${LLM_MODEL}).`,
         });
 
         const allHits: object[] = [];
         let totalPagesScanned = 0;
         let totalProductsChecked = 0;
 
-        // Run all keywords in parallel — pages within each keyword stay sequential,
-        // product details within each page are already parallelized.
-        // This keeps total time = max(single keyword time) instead of sum.
+        // All keywords run in parallel
         keywords.forEach((kw) => send("keyword_start", { keyword: kw }));
 
         const keywordResults = await Promise.all(
-          keywords.map((keyword) =>
-            scanKeyword(keyword, maxPages, zipCode, send)
-          )
+          keywords.map((keyword) => scanKeyword(keyword, maxPages, zipCode, client, send))
         );
 
         for (let i = 0; i < keywords.length; i++) {
@@ -424,18 +437,20 @@ export async function POST(req: NextRequest) {
           send("keyword_done", {
             keyword: keywords[i],
             hits: hits.length,
-            message: `[${keywords[i]}] Done — ${hits.length} hit(s) found across ${pagesScanned} pages.`,
+            message: `[${keywords[i]}] Done — ${hits.length} hit(s) across ${pagesScanned} pages.`,
           });
         }
 
-        // Deduplicate hits by ASIN — same product caught by multiple keywords = one entry
-        const seenAsins = new Set<string>();
-        const dedupedHits = allHits.filter((h) => {
-          const asin = (h as { asin: string }).asin;
-          if (seenAsins.has(asin)) return false;
-          seenAsins.add(asin);
-          return true;
-        });
+        // Deduplicate by ASIN — keep the higher-confidence verdict if duplicate
+        const asinMap = new Map<string, object>();
+        for (const hit of allHits) {
+          const h = hit as { asin: string; confidence: number };
+          const existing = asinMap.get(h.asin) as { confidence: number } | undefined;
+          if (!existing || h.confidence > existing.confidence) {
+            asinMap.set(h.asin, hit);
+          }
+        }
+        const dedupedHits = Array.from(asinMap.values());
 
         send("done", {
           report: {
@@ -444,6 +459,7 @@ export async function POST(req: NextRequest) {
             sellerScope: "Asia-based sellers (excl. Japan) on Amazon.com",
             zipCode,
             keywords,
+            aiModel: LLM_MODEL,
             pages_crawled: totalPagesScanned,
             total_products_checked: totalProductsChecked,
             generatedAt: new Date().toISOString(),
