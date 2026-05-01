@@ -20,31 +20,34 @@ const AMAZON_SELLERS = new Set([
   "amazon",
 ]);
 
-const DIGITAL_SIGNALS = [
-  "kindle edition", "kindle", "ebook", "e-book",
-  "prime video", "digital", "digital download",
-  "digital music", "audible", "streaming",
-  "digital edition", "online game code", "game download",
-  "software download", "mp3",
+// ── Pre-filter: ONLY the most unambiguous eliminations ───────────────────────
+// Keep this list SHORT and OBVIOUS. Borderline cases go to the LLM.
+// Do NOT add things like "digital", "complete series", "art of" — too aggressive.
+
+const HARD_DIGITAL_SIGNALS = [
+  "kindle edition",
+  "prime video",
+  "audible audiobook",
+  "mp3 music",
+  "digital download",
+  "online game code",
+  "software download",
 ];
 
-const MEDIA_TITLE_SIGNALS = [
-  "blu-ray", "4k ultra hd", "[dvd]", "(dvd)", " dvd", "dvd set",
-  "film collection", "movie collection", "complete series",
-  "complete seasons", "the complete animated series",
-  "season 1", "season 2", "season 3", "criterion collection",
-  "(theatrical)", "[blu-ray]", "[4k]", "bonus features",
-  "motion picture", "animated series", "anime collection",
+const HARD_MEDIA_TITLE_SIGNALS = [
+  // Physical video media — not merch
+  "[blu-ray]", "(blu-ray)", "blu-ray]",
+  "[dvd]", "(dvd)",
+  "4k ultra hd",
+  "criterion collection",
+  "(theatrical edition)",
+  "[4k uhd]",
 ];
 
-const BOOK_TITLE_SIGNALS = [
-  "coloring book", "art book", "illustrated history", "official history",
-  "encyclopedia", "the art of", "making of", "biography", "history of",
-  "pinball machine", "puzzle", "jigsaw",
-];
-
-const MEDIA_CATEGORIES = [
-  "movies & tv", "blu-ray", "dvd", "amazon video", "prime video",
+const HARD_MEDIA_CATEGORIES = [
+  // Amazon category breadcrumbs that definitively mean video media
+  "prime video",
+  "amazon video",
 ];
 
 // ── Oxylabs helpers ───────────────────────────────────────────────────────────
@@ -101,26 +104,26 @@ function isAmazonSeller(seller: string): boolean {
   return AMAZON_SELLERS.has(seller.trim().toLowerCase());
 }
 
-function isDigital(title: string, variations: { title?: string }[] = []): boolean {
+function isHardDigital(title: string, variations: { title?: string }[] = []): boolean {
   const t = title.toLowerCase();
-  if (DIGITAL_SIGNALS.some((s) => t.includes(s))) return true;
-  const digitalVarTypes = new Set(["kindle edition", "prime video", "digital", "mp3", "audible"]);
+  if (HARD_DIGITAL_SIGNALS.some((s) => t.includes(s))) return true;
+  // Only eliminate if ALL variations are digital
+  const digitalVarTypes = new Set(["kindle edition", "prime video", "audible audiobook", "mp3 music"]);
   if (variations.length > 0) {
     const allDigital = variations.every((v) => {
       const vt = (v.title ?? "").toLowerCase();
-      return DIGITAL_SIGNALS.some((s) => vt.includes(s)) || digitalVarTypes.has(vt);
+      return digitalVarTypes.has(vt);
     });
     if (allDigital) return true;
   }
   return false;
 }
 
-function isMediaProduct(title: string, category: string): boolean {
+function isHardMedia(title: string, category: string): boolean {
   const t = title.toLowerCase();
   const c = category.toLowerCase();
-  if (MEDIA_TITLE_SIGNALS.some((s) => t.includes(s))) return true;
-  if (BOOK_TITLE_SIGNALS.some((s) => t.includes(s))) return true;
-  if (MEDIA_CATEGORIES.some((s) => c.includes(s))) return true;
+  if (HARD_MEDIA_TITLE_SIGNALS.some((s) => t.includes(s))) return true;
+  if (HARD_MEDIA_CATEGORIES.some((s) => c.includes(s))) return true;
   return false;
 }
 
@@ -182,7 +185,9 @@ Below are Amazon product listings that passed automated pre-filters. Assess each
 Verdict options:
 - "flag": High confidence this is unauthorized/counterfeit — third-party seller with no visible authorization, suspicious pricing, generic seller names, products that seem like knock-offs
 - "review": Uncertain — could be authorized reseller or counterfeit, a human should check
-- "skip": Likely legitimate — known authorized reseller, clearly licensed merchandise, major established retailer
+- "skip": Definitely NOT counterfeit — known major authorized retailer (Target, Walmart, Best Buy, GameStop, Hot Topic, etc.), clearly licensed/official merchandise with proper branding, physical media like DVDs/Blu-rays, official books/art books, or products where the brand keyword appears only incidentally (e.g. a book titled 'The Art of Godzilla' is official, not counterfeit)
+
+IMPORTANT: Physical merchandise (toys, figures, clothing, accessories) sold by small/unknown third-party sellers with no obvious authorization signal should generally be 'flag' or 'review'. Be especially suspicious of very low prices. Books, official art books, and licensed media should be 'skip'.
 
 For each product also guess the seller's geographic origin based on seller name patterns, pricing, and any other signals.
 
@@ -260,14 +265,14 @@ async function scanKeyword(
       ...((resultsBlock.amazons_choices as Record<string, unknown>[]) ?? []),
     ];
 
-    // ── Stage 1: Deterministic pre-filter ─────────────────────────────────────
+    // ── Stage 1: Hard pre-filter (unambiguous eliminations only) ─────────────
     const preFiltered = items.filter((item) => {
       const title = (item.title as string) ?? "";
       const variations = (item.variations as { title?: string }[]) ?? [];
-      if (!keywordInTitle(title, keyword)) return false;
-      if (isDigital(title, variations)) return false;
-      if (isMediaProduct(title, "")) return false;
-      return true;
+      if (!keywordInTitle(title, keyword)) return false;  // must contain keyword
+      if (isHardDigital(title, variations)) return false; // definitely digital
+      if (isHardMedia(title, "")) return false;           // definitely video media
+      return true; // everything else goes to LLM
     });
 
     send("progress", {
@@ -298,11 +303,12 @@ async function scanKeyword(
         const detailTitle = (dc.title as string) ?? title;
         const detailVariations = (dc.variation as { title?: string }[]) ?? [];
 
-        // Hard deterministic eliminators — no point sending to LLM
+        // Hard eliminators after detail fetch — still unambiguous only
         if (!seller) return null;
         if (isAmazonSeller(seller)) return null;
-        if (isDigital(detailTitle, Array.isArray(detailVariations) ? detailVariations : [])) return null;
-        if (isMediaProduct(detailTitle, category)) return null;
+        if (isHardDigital(detailTitle, Array.isArray(detailVariations) ? detailVariations : [])) return null;
+        if (isHardMedia(detailTitle, category)) return null;
+        // NOTE: Books, coloring books, "digital camo" shirts, etc. go to LLM — not eliminated here
 
         return {
           asin,
