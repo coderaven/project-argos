@@ -405,24 +405,37 @@ export async function POST(req: NextRequest) {
         let totalPagesScanned = 0;
         let totalProductsChecked = 0;
 
-        // Run keywords sequentially to avoid hammering Oxylabs
-        for (const keyword of keywords) {
-          send("keyword_start", { keyword });
-          const { hits, pagesScanned, productsChecked } = await scanKeyword(
-            keyword,
-            maxPages,
-            zipCode,
-            send
-          );
+        // Run all keywords in parallel — pages within each keyword stay sequential,
+        // product details within each page are already parallelized.
+        // This keeps total time = max(single keyword time) instead of sum.
+        keywords.forEach((kw) => send("keyword_start", { keyword: kw }));
+
+        const keywordResults = await Promise.all(
+          keywords.map((keyword) =>
+            scanKeyword(keyword, maxPages, zipCode, send)
+          )
+        );
+
+        for (let i = 0; i < keywords.length; i++) {
+          const { hits, pagesScanned, productsChecked } = keywordResults[i];
           allHits.push(...hits);
           totalPagesScanned += pagesScanned;
           totalProductsChecked += productsChecked;
           send("keyword_done", {
-            keyword,
+            keyword: keywords[i],
             hits: hits.length,
-            message: `[${keyword}] Done — ${hits.length} hit(s) found across ${pagesScanned} pages.`,
+            message: `[${keywords[i]}] Done — ${hits.length} hit(s) found across ${pagesScanned} pages.`,
           });
         }
+
+        // Deduplicate hits by ASIN — same product caught by multiple keywords = one entry
+        const seenAsins = new Set<string>();
+        const dedupedHits = allHits.filter((h) => {
+          const asin = (h as { asin: string }).asin;
+          if (seenAsins.has(asin)) return false;
+          seenAsins.add(asin);
+          return true;
+        });
 
         send("done", {
           report: {
@@ -434,7 +447,7 @@ export async function POST(req: NextRequest) {
             pages_crawled: totalPagesScanned,
             total_products_checked: totalProductsChecked,
             generatedAt: new Date().toISOString(),
-            hits: allHits,
+            hits: dedupedHits,
           },
         });
       } catch (err) {
